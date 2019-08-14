@@ -6,6 +6,10 @@ Project for using machine learning for analysis of multispectral Sentinel 2 sate
 
 Clone this repository
 
+## Model
+
+![runet.png](./Documentation/model.png)
+
 ### Prerequisites
 
 This project requires Python, [TensorFlow](https://www.tensorflow.org/) and [GDAL](https://gdal.org/).
