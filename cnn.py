@@ -1,0 +1,347 @@
+# -*- coding: utf-8 -*-
+"""
+Module for training and testing convolutional nural networks
+
+Created on Fri Mar 29 08:53:15 2019
+
+@author: runaas
+"""
+
+import ast
+import os
+import numpy as np
+import tensorflow as tf
+import gdal
+import training_data
+
+# Enable debugging
+# from tensorflow.python import debug as tf_debug
+# tf.keras.backend.set_session(tf_debug.LocalCLIDebugWrapperSession(tf.Session()))
+
+
+def cnn_block(x, channels, block_name, use_bn, activation):
+    """Create bn-conv2D-bn-conv2D block"""
+
+    if use_bn:
+        # Batch normalization without learned gamma - beta parameters (as there is a linear transform in the next stage)
+        x = tf.keras.layers.BatchNormalization(name=block_name + "_norm1", center=False, scale=False)(x)
+
+    # 3x3 convolution layer
+    x = tf.keras.layers.Conv2D(channels, (3, 3), padding="same",
+                                   name=block_name+"_conv1",
+                                   activation=activation,
+                                   data_format="channels_last")(x)
+
+    if use_bn:
+        # Batch normalization without learned gamma - beta parameters (as there is a linear transform in the next stage)
+        x = tf.keras.layers.BatchNormalization(name=block_name + "_norm2", center=False, scale=False)(x)
+
+    # 3x3 convolution layer
+    x = tf.keras.layers.Conv2D(channels, (3, 3), padding="same",
+                                   name=block_name+"_conv2",
+                                   activation=activation,
+                                   data_format="channels_last")(x)
+
+    return x
+
+
+def unet_model(patch_height, patch_width, n_input_ch, n_output_cat, depth, n_features=32,
+               use_bn=True, dropout=0.0, activation="relu"):
+    """Create unet model"""
+
+    # Input tensor
+    x = input = tf.keras.layers.Input((patch_height, patch_width, n_input_ch))
+
+    # Downsample
+    block_down =  []
+    for i in range(1, depth):
+        block_name = "block_down" + str(i)
+        # Convolution - normalize block
+        block = cnn_block(x, n_features * 2 ** (i-1), block_name, use_bn, activation)
+        # Save output for upsampling stage
+        block_down.append(block)
+        # Downsample
+        x = tf.keras.layers.MaxPooling2D(pool_size=(2, 2), name=block_name + "_pool",
+                                             data_format="channels_last")(block)
+
+    # Final downsampled block
+    x = cnn_block(x, n_features * 2 ** (depth-1), "block_bottom", use_bn, activation)
+
+    # Upsample
+    for i in reversed(range(1, depth)):
+        block_name = "block_up" + str(i)
+        # Upsample
+        up =  tf.keras.layers.Conv2DTranspose(n_features * 2**(i-1), (3, 3), strides=(2, 2),
+                                              name=block_name+"_upconv", activation=activation, padding='same') (x)
+        # up = tf.keras.layers.UpSampling2D((2,2), name=block_name+"_upsample")(x)
+        # Add input from downsampling stage
+        cnct = tf.keras.layers.concatenate([up, block_down[i-1]], name=block_name+"_concat")
+        # Dropout
+        if dropout > 0:
+            cnct = tf.keras.layers.Dropout(dropout, name=block_name+"_drop")(cnct)
+        # Convolution block
+        x = cnn_block(cnct, n_features * 2 ** (i-1), block_name, False, activation)
+
+    # Output layers with 1x1 "convolution"
+    # Dropout
+    if dropout > 0:
+        x = tf.keras.layers.Dropout(dropout, name="out_drop")(x)
+    x = tf.keras.layers.Conv2D(n_features, (1, 1), padding="same",
+                                    name="out_conv",
+                                    activation=activation,
+                                    data_format="channels_last")(x)
+    output = tf.keras.layers.Conv2D(n_output_cat, (1, 1), padding="same",
+                                    name="out_softmax",
+                                    activation="softmax",
+                                    data_format="channels_last")(x)
+
+    # model
+    model = tf.keras.models.Model(inputs=input, outputs=output)
+    return model
+
+def unet_model2(patch_height, patch_width, n_input_ch_10, n_input_ch_20, n_output_cat, depth, n_features=32,
+               use_bn=True, dropout=0.0, activation="relu"):
+    """Create unet model with dual resolution input"""
+
+    # Input tensor1
+    input10 = tf.keras.layers.Input((patch_height, patch_width, n_input_ch_10))
+    input20 = tf.keras.layers.Input((patch_height // 2, patch_width // 2, n_input_ch_20))
+
+    #List of skip connections
+    block_down = []
+
+    # First downsample block
+    block_name = "input10_block_down1"
+    # Convolution - normalize block
+    block = cnn_block(input10, n_features, block_name, use_bn, activation)
+    # Save output for upsampling stage
+    block_down.append(block)
+    # Downsample
+    x10 = tf.keras.layers.MaxPooling2D(pool_size=(2, 2), name=block_name + "_pool",
+                                     data_format="channels_last")(block)
+
+    # Half resolution input
+    block_name = "input20_block_down1"
+    x20 = cnn_block(input20, n_features, block_name, use_bn, activation)
+
+    # Concatenate the two input paths
+    x = tf.keras.layers.concatenate([x10, x20], name="input_concat")
+
+    # Downsample branch
+    for i in range(2, depth):
+        block_name = "block_down" + str(i)
+        # Convolution - normalize block
+        block = cnn_block(x, n_features * 2 ** (i-1), block_name, use_bn, activation)
+        # Save output for upsampling stage
+        block_down.append(block)
+        # Downsample
+        x = tf.keras.layers.MaxPooling2D(pool_size=(2, 2), name=block_name + "_pool",
+                                             data_format="channels_last")(block)
+
+    # Final downsampled block
+    x = cnn_block(x, n_features * 2 ** (depth-1), "block_bottom", use_bn, activation)
+
+    # Upsample branch
+    for i in reversed(range(2, depth)):
+        block_name = "block_up" + str(i)
+        # Upsample
+        up =  tf.keras.layers.Conv2DTranspose(n_features * 2**(i-1), (3, 3), strides=(2, 2),
+                                              name=block_name+"_upconv", activation=activation, padding='same') (x)
+        # up = tf.keras.layers.UpSampling2D((2,2), name=block_name+"_upsample")(x)
+        # Add input from downsampling stage
+        cnct = tf.keras.layers.concatenate([up, block_down[i-1]], name=block_name+"_concat")
+        # Dropout
+        if dropout > 0:
+            cnct = tf.keras.layers.Dropout(dropout, name=block_name+"_drop")(cnct)
+        # Convolution block
+        x = cnn_block(cnct, n_features * 2 ** (i-1), block_name, False, activation)
+
+    block_name = "block_up1"
+    # Last upsample
+    up =  tf.keras.layers.Conv2DTranspose(n_features, (3, 3), strides=(2, 2),
+                                              name=block_name+"_upconv", activation=activation, padding='same') (x)
+
+    # Add input from downsampling stage
+    cnct = tf.keras.layers.concatenate([up, block_down[0]], name=block_name+"_concat")
+    # Dropout
+    if dropout > 0:
+        cnct = tf.keras.layers.Dropout(dropout, name=block_name+"_drop")(cnct)
+    # Convolution block
+    x = cnn_block(cnct, n_features, block_name, False, activation)
+
+    # Output layers with 1x1 "convolution"
+    # Dropout
+    if dropout > 0:
+        x = tf.keras.layers.Dropout(dropout, name="out_drop")(x)
+    x = tf.keras.layers.Conv2D(n_features, (1, 1), padding="same",
+                                    name="out_conv",
+                                    activation=activation,
+                                    data_format="channels_last")(x)
+    output = tf.keras.layers.Conv2D(n_output_cat, (1, 1), padding="same",
+                                    name="out_softmax",
+                                    activation="softmax",
+                                    data_format="channels_last")(x)
+
+    # model
+    model = tf.keras.models.Model(inputs=(input10, input20), outputs=output)
+    return model
+
+
+class TrainingData:
+    """Interpret and load one line of training data.
+
+    Expect each line to be of the form
+    "('path to 10m multispectral training image', 'path to 20m multispectral training image', 'path to 10m categorical target image')"
+
+    Arguments
+    ---------
+    X10: (128, 128, n_channels_10) ndarray
+        10m resolution images
+    X20: (64, 64, n_channels_20) ndarray
+        20m resolution images
+    Y: (128, 128, 1) ndarray
+        Target categorical image
+    xform, proj:
+        Image transform from target image, used for storing predicted test images with same coordinate system
+    """
+    def __init__(self, line):
+        self.paths = ast.literal_eval(line)
+        ds = gdal.Open(self.paths[0])
+        self.X10 = np.concatenate([np.expand_dims(ds.GetRasterBand(b_ix + 1).ReadAsArray(), 2) for b_ix in range(ds.RasterCount)], 2).astype('f4')
+        self.X10 /= 2 ** 16 - 1
+        ds = gdal.Open(self.paths[1])
+        self.X20 = np.concatenate([np.expand_dims(ds.GetRasterBand(b_ix + 1).ReadAsArray(), 2) for b_ix in range(ds.RasterCount)], 2).astype('f4')
+        self.X20 /= 2 ** 16 - 1
+        ds = gdal.Open(self.paths[2])
+        self.Y = np.expand_dims(ds.GetRasterBand(1).ReadAsArray(), 2)
+        # self.Y = tgt_ds.GetRasterBand(1).ReadAsArray()
+        self.predict = None
+        self.xform = ds.GetGeoTransform()
+        self.proj = ds.GetProjection()
+
+def main():
+    # parameters
+
+    # Number of output categories
+    n_cat = 14
+    # Number of input channels
+    n_ch_10 = 4
+    n_ch_20 = 6
+
+    # Depth of unet (number of bn-conv-relu-bn-conv-relu blocks)
+    # 3 = 0.7720, 4 = 0.77209
+    depth = 3
+    # Minibatch size
+    batch_size = 70
+    # No epochs
+    epochs = 100
+    # Dropout rate
+        #0.2 = 0.7720
+    drop_rate = 0.50
+    # Activation function
+    activation="relu"
+    # Capacity (number of features in first feature layer)
+    capacity = 32
+    #Optimizer algorithm. So far supported algs are: 'adam', 'adagrad', 'SGD'
+        #So far adam gives best result (adam = 0.7720, adagrad = 0.7428, SGD = 0.72813)
+    optimizer = 'adam'
+
+    # use batch normalization
+    use_bn = True
+    # Do training
+    do_train = True
+    # Do testing
+    do_test = True
+
+    # Directory and file info
+    run_dir = "run"
+    run_name = f"10m20m_depth{depth:02}_cap{capacity:03}{'_bn_' if use_bn else '_nbn_'}drop{int(drop_rate*100):02}_{activation}_opt{optimizer}_v6_best"
+    #model_fn = model filename
+    model_fn = os.path.join(run_dir, run_name, "model.hdf5")
+    log_dir = os.path.join(run_dir, run_name, "log")
+    test_dir = os.path.join(run_dir, run_name, "test")
+    os.makedirs(test_dir, exist_ok=True)
+
+    # Callbacks for model fitting and evaluation
+    tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1,
+                                                    write_graph=True, write_grads=True, write_images=False,
+                                                    update_freq='batch')
+    checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(model_fn, monitor='val_acc', verbose=1, save_best_only=True)
+    earlystop_cb = tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=10)
+
+    model = None
+    if os.path.exists(model_fn):
+        model = tf.keras.models.load_model(model_fn)
+
+    if do_train or not model:
+        # Read training data set
+        with open(os.path.join(training_data.data_path, "train_set.txt"), "r") as file:
+            train_set = [TrainingData(img_fn.strip()) for img_fn in file]
+        # create training tensors
+        train_x = (np.concatenate([np.expand_dims(td.X10, 0) for td in train_set], 0),
+                   np.concatenate([np.expand_dims(td.X20, 0) for td in train_set], 0))
+        train_y = np.concatenate([np.expand_dims(td.Y, 0) for td in train_set], 0)
+
+        # Read validation data set
+        with open(os.path.join(training_data.data_path, "valid_set.txt"), "r") as file:
+            valid_set = [TrainingData(img_fn.strip()) for img_fn in file]
+        # Create validation tensors
+        valid_x = (np.concatenate([np.expand_dims(td.X10, 0) for td in valid_set], 0),
+                   np.concatenate([np.expand_dims(td.X20, 0) for td in valid_set], 0))
+        valid_y = np.concatenate([np.expand_dims(td.Y, 0) for td in valid_set], 0)
+
+        if not model:
+            # If model doesn't exist, create one
+            os.makedirs(os.path.dirname(model_fn), exist_ok=True)
+            model = unet_model2(train_x[0].shape[1], train_x[0].shape[2], n_ch_10, n_ch_20, n_cat, depth, n_features=capacity,
+                               use_bn=use_bn, dropout=drop_rate, activation=activation)
+            if optimizer == 'adagrad':
+                opz=tf.keras.optimizers.Adagrad()
+            elif optimizer == 'adam':
+                opz=tf.keras.optimizers.Adam()
+            elif optimizer == 'SGD':
+                opz=tf.keras.optimizers.SGD()
+            else:
+                raise ValueError('illegal optimizer chosen: '+ optimizer)
+            
+            model.compile(optimizer=opz, loss='sparse_categorical_crossentropy',
+                            metrics=['accuracy'])
+            
+        # Do training and validation
+        cb = [tensorboard_cb, checkpoint_cb, earlystop_cb]
+        model.fit(train_x, train_y, callbacks=cb, validation_data=(valid_x, valid_y), batch_size=batch_size, epochs=epochs)
+
+    if do_test:
+        # Load the "best" model
+        model = tf.keras.models.load_model(model_fn)
+        # Read test data set
+        with open(os.path.join(training_data.data_path, "test_set.txt"), "r") as file:
+            test_set = [TrainingData(img_fn.strip()) for img_fn in file]
+        # Create test data tensors
+        test_x = (np.concatenate([np.expand_dims(td.X10, 0) for td in test_set], 0),
+                  np.concatenate([np.expand_dims(td.X20, 0) for td in test_set], 0))
+        test_y = np.concatenate([np.expand_dims(td.Y, 0) for td in test_set], 0)
+
+        # Evaluate model on test data
+        model.evaluate(test_x, test_y)
+        # Predict test data from model
+        test_pred = model.predict(test_x)
+        # Find class from output probability vectors
+        test_pred_cat = np.argmax(test_pred, axis=-1).astype("B")
+
+        # Export test data as geotiff
+        for i, test_sample in enumerate(test_set):
+            predict_fn = os.path.basename(test_sample.paths[2])
+            ix = predict_fn.rfind("_")
+            predict_fn = predict_fn[:ix] + "_predict.tif"
+            ds = gdal.GetDriverByName('GTiff').Create(os.path.join(test_dir, predict_fn),
+                                                  test_pred.shape[1], test_pred.shape[2], 1, gdal.GDT_Byte,
+                                                  ['COMPRESS=LZW', 'PREDICTOR=2'])
+            ds.SetGeoTransform(test_sample.xform)
+            ds.SetProjection(test_sample.proj)
+            ds.GetRasterBand(1).WriteArray(test_pred_cat[i,:,:])
+            ds = None
+
+
+if __name__ == "__main__":
+    main()
